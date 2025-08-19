@@ -5,21 +5,36 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
-    branches: [master]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    name: Test and build
+    container:
+      image: quay.io/ovirt/buildcontainer:el10stream
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Run maven build
+        run: |
+          ./autogen.sh
+          ./configure
+          mvn test -P\!slow-tests-disabled
+
+  build-rpms:
+    runs-on: ubuntu-latest
+    needs: build
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: centos-stream-8
-            shortcut: cs8
-            container-name: el8stream
           - name: centos-stream-9
             shortcut: cs9
             container-name: el9stream
+          - name: centos-stream-10
+            shortcut: cs10
+            container-name: el10stream
 
     name: ${{ matrix.name }}
 
@@ -45,3 +60,41 @@ jobs:
       uses: ovirt/upload-rpms-action@main
       with:
         directory: ${{ env.ARTIFACTS_DIR }}
+
+  publish-snapshot:
+    needs: build-rpms
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    name: Publish snapshot to maven central
+
+    container:
+      image: quay.io/ovirt/buildcontainer:el10stream
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Mark git repo as safe
+        run: git config --global --add safe.directory $(pwd)
+
+      - name: Use cache for maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Set up Maven settings.xml
+        uses: s4u/maven-settings-action@v3.1.0
+        with:
+          path: /root/.m2/settings.xml
+          servers: |
+            [{
+              "id": "central",
+              "username": "${{ secrets.SONATYPE_USERNAME }}",
+              "password": "${{ secrets.SONATYPE_TOKEN }}"
+            }]
+
+      - name: Publish snapshot
+        run: mvn --batch-mode -DskipTests deploy
